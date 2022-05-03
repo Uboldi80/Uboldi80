@@ -1,54 +1,135 @@
-# GitHub Action for generating a contribution graph with a snake eating your contributions.
+import fnmatch
+import os
+import snakemake.utils
 
-name: Generate Snake
+from builds import prepare_builds
 
-# Controls when the action will run. This action runs every 6 hours.
+shell.prefix("source activate janus_python2; ")
+configfile: "config.json"
+localrules: prepare_virus_lineage, download, clean, push
+wildcard_constraints:
+    virus="[a-zA-Z0-9]+"
 
-on:
-  schedule:
-      # every 6 hours
-    - cron: "0 */6 * * *"
+# Set snakemake directory
+SNAKEMAKE_DIR = os.path.dirname(workflow.snakefile)
 
-# This command allows us to run the Action automatically from the Actions tab.
-  workflow_dispatch:
+# Create the cluster log directory.
+snakemake.utils.makedirs("log/cluster")
 
-# The sequence of runs in this workflow:
-jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
+#
+# Functions to prepare builds from config.
+#
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
-    steps:
+def _get_prepare_arguments(wildcards):
+    """Build a string of command line arguments to run the given build through
+    augur's prepare step.
+    """
+    params = [
+        "lineage",
+        "resolution",
+        "segments"
+    ]
 
-    # Checks repo under $GITHUB_WORKSHOP, so your job can access it
-      - uses: actions/checkout@v2
+    build = BUILDS[wildcards.stem]
+    arguments = []
+    for param in params:
+        if param in build:
+            arguments.append("--%s %s" % (param, build[param]))
 
-    # Generates the snake  
-      - uses: Platane/snk@master
-        id: snake-gif
-        with:
-          github_user_name: mishmanners
-          # these next 2 lines generate the files on a branch called "output". This keeps the main branch from cluttering up.
-          gif_out_path: dist/github-contribution-grid-snake.gif
-          svg_out_path: dist/github-contribution-grid-snake.svg
+    if "prepare" in build:
+        arguments.append(build["prepare"])
 
-     # show the status of the build. Makes it easier for debugging (if there's any issues).
-      - run: git status
+    return " ".join(arguments)
 
-      # Push the changes
-      - name: Push changes
-        uses: ad-m/github-push-action@master
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          branch: master
-          force: true
+def _get_process_arguments(wildcards):
+    """Build a string of command line arguments to run the given build through
+    augur's process step.
+    """
+    return BUILDS[wildcards.stem].get("process", "")
 
-      - uses: crazy-max/ghaction-github-pages@v2.1.3
-        with:
-          # the output branch we mentioned above
-          target_branch: output
-          build_dir: dist
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+#
+# Determine which builds to create.
+#
+
+BUILDS = prepare_builds(config["builds"])
+
+# Filter builds by command line constraints. Filters are defined by
+# comma-delimited wildcard patterns (e.g., "flu_*,zika").
+if "filters" in config:
+    # Find builds that match filters.
+    build_stems = list(BUILDS.keys())
+    filters = config["filters"].split(",")
+    included_builds = [build_stem for build_stem in build_stems
+                       if any([fnmatch.fnmatch(build_stem, pattern) for pattern in filters])]
+
+    # Remove builds that don't match filters.
+    for build_stem in build_stems:
+        if build_stem not in included_builds:
+            del BUILDS[build_stem]
+
+print("Found the following %i builds:" % len(BUILDS))
+for build_stem in BUILDS:
+    print(" - %s" % build_stem)
+
+#
+# Prepare and process viruses by lineage.
+#
+
+OUTPUT_FILES = ["augur/builds/%s/auspice/%s_meta.json" % (build["virus"], stem)
+                for stem, build in BUILDS.items()]
+
+rule build:
+    input: OUTPUT_FILES
+
+# Push all requested JSONs to a given S3 bucket.
+rule push:
+    input: OUTPUT_FILES
+    params:
+        bucket=config["s3_bucket"],
+        paths=[path.replace("_meta", "_*") for path in OUTPUT_FILES]
+    log: "log/s3_push.log"
+    benchmark: "benchmarks/s3_push.txt"
+    shell: "python augur/scripts/s3.py -v push {params.bucket} {params.paths} &> {log}"
+
+rule process_virus_lineage:
+    input: "augur/builds/{virus}/prepared/{stem}.json"
+    output: "augur/builds/{virus}/auspice/{stem}_meta.json"
+    log: "log/process_{stem}.log"
+    benchmark: "benchmarks/process_{stem}.txt"
+    params: arguments=_get_process_arguments
+    shell: """cd augur/builds/{wildcards.virus} && python {wildcards.virus}.process.py \
+                  -j {SNAKEMAKE_DIR}/{input} {params.arguments} &> {SNAKEMAKE_DIR}/{log}"""
+
+rule prepare_virus_lineage:
+    output: "augur/builds/{virus}/prepared/{stem}.json"
+    log: "log/prepare_{stem}.log"
+    benchmark: "benchmarks/prepare_{stem}.txt"
+    params: arguments=_get_prepare_arguments
+    shell: """cd augur/builds/{wildcards.virus} && python {wildcards.virus}.prepare.py \
+                  --file_prefix {wildcards.stem} \
+                  {params.arguments} &> {SNAKEMAKE_DIR}/{log}"""
+
+rule download:
+    run:
+        # Find all unique fauna commands to run.
+        all_fauna_args = set()
+        for build in BUILDS.values():
+            if "fauna" in build:
+                fauna_args = build["fauna"]
+            else:
+                fauna_args = "--virus %s --sequences" % build["virus"]
+
+            all_fauna_args.add(fauna_args)
+
+        # Run unique fauna commands.
+        for fauna_args in all_fauna_args:
+            print("Fauna args: %s" % fauna_args)
+            shell("cd fauna && python download_all.py %s" % fauna_args)
+
+rule clean:
+    run:
+        viruses = list(set([build["virus"] for build in BUILDS.values()]))
+        for virus in viruses:
+            shell("rm -rf augur/builds/{virus}/prepared/*".format(virus=virus))
+            shell("rm -rf augur/builds/{virus}/processed/*".format(virus=virus))
+            shell("rm -rf augur/builds/{virus}/auspice/*".format(virus=virus))
